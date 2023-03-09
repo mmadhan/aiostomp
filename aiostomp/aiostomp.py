@@ -193,8 +193,8 @@ class AioStomp:
                 self._resubscribe_queues()
                 return
 
-            except OSError:
-                logger.info("Connecting to stomp server failed.")
+            except OSError as exception:
+                logger.info("Connecting to stomp server failed. Exception : %s" , exception)
 
                 if self._should_retry():
                     logger.info("Retrying in %s seconds", self._retry_interval)
