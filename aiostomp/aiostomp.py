@@ -13,7 +13,7 @@ from aiostomp.errors import StompError, StompDisconnectedError, ExceededRetryCou
 from aiostomp.subscription import Subscription
 from aiostomp.heartbeat import StompHeartbeater
 
-AIOSTOMP_ENABLE_STATS = bool(os.environ.get("AIOSTOMP_ENABLE_STATS", False))
+AIOSTOMP_ENABLE_STATS = bool(os.environ.get("AIOSTOMP_ENABLE_STATS", True))
 AIOSTOMP_STATS_INTERVAL = int(os.environ.get("AIOSTOMP_STATS_INTERVAL", 10))
 logger = logging.getLogger("aiostomp")
 
@@ -194,7 +194,9 @@ class AioStomp:
                 return
 
             except OSError as exception:
-                logger.info("Connecting to stomp server failed. Exception : %s" , exception)
+                logger.info(
+                    "Connecting to stomp server failed. Exception : %s", exception
+                )
 
                 if self._should_retry():
                     logger.info("Retrying in %s seconds", self._retry_interval)
@@ -269,7 +271,7 @@ class AioStomp:
             return value.encode("utf-8")
         return value
 
-    def send(
+    async def send(
         self,
         destination: str,
         body: Union[str, bytes] = "",
@@ -286,7 +288,7 @@ class AioStomp:
         if send_content_length:
             headers["content-length"] = len(body_b)
 
-        self._protocol.send(headers, body_b)
+        await self._protocol.send(headers, body_b)
 
     def _subscription_auto_ack(self, frame: Frame) -> bool:
         key = frame.headers.get("subscription", "")
@@ -334,6 +336,7 @@ class StompReader(asyncio.Protocol):
             "MESSAGE": self._handle_message,
             "CONNECTED": self._handle_connect,
             "ERROR": self._handle_error,
+            "HEARTBEAT": self._beat,
         }
 
         self.heartbeat = heartbeat or {}
@@ -368,6 +371,13 @@ class StompReader(asyncio.Protocol):
         if password is not None:
             self._connect_headers["passcode"] = password
 
+    async def _beat(self, _: Frame) -> None:
+        """
+        Update last beat time stamp
+        """
+        if self.heartbeater:
+            self.heartbeater.beat()
+
     def close(self) -> None:
         # Close the transport only if already connection is made
         if self._transport:
@@ -384,7 +394,17 @@ class StompReader(asyncio.Protocol):
             raise StompDisconnectedError()
         self._transport.write(buf)
 
-    def send_frame(
+    async def _wait_for_heartbeat(self):
+
+        if self.heartbeat.get("enabled"):
+            while self.heartbeater is None:
+                logger.debug("Waiting for heartbeater to init")
+                await asyncio.sleep(1)
+            while self.heartbeater is None or not self.heartbeater.is_healthy:
+                logger.debug("Waiting for Heartbeat Ping")
+                await asyncio.sleep(1)
+
+    async def send_frame(
         self,
         command: str,
         headers: Optional[Dict[str, Any]] = None,
@@ -393,13 +413,22 @@ class StompReader(asyncio.Protocol):
         headers = {} if headers is None else headers
         buf = self._protocol.build_frame(command, headers, body)
 
+        await self._wait_for_heartbeat()
+        if self.heartbeater and not self.heartbeater.is_healthy:
+            raise StompDisconnectedError()
         if not self._transport:
+            raise StompDisconnectedError()
+
+        if not self.is_connected:
             raise StompDisconnectedError()
 
         if self._stats:
             self._stats.increment("sent_msg")
 
         self._transport.write(buf)
+        self.heartbeater.reset_time_stamp()
+        if self.heartbeater:
+            self.heartbeater.reset_time_stamp()
 
     def ack(self, frame: Frame) -> None:
         headers = {
@@ -431,6 +460,7 @@ class StompReader(asyncio.Protocol):
         super().connection_lost(exc)
 
         self._transport = None
+        self.is_connected = False
 
         if self.heartbeater:
             self.heartbeater.shutdown()
@@ -450,9 +480,7 @@ class StompReader(asyncio.Protocol):
             if sy:
                 interval = max(self.heartbeat.get("cx", 0), sy)
                 logger.debug("Sending heartbeats every %sms", interval)
-                self.heartbeater = StompHeartbeater(
-                    self._transport, interval=interval
-                )
+                self.heartbeater = StompHeartbeater(self._transport, interval=interval)
                 await self.heartbeater.start()
 
     async def _handle_message(self, frame: Frame) -> None:
@@ -493,10 +521,9 @@ class StompReader(asyncio.Protocol):
         self._protocol.feed_data(data)
 
         for frame in self._protocol.pop_frames():
-            if frame.command != "HEARTBEAT":
-                self._loop.create_task(
-                    self.handlers_map.get(frame.command, self._handle_exception)(frame)
-                )
+            self._loop.create_task(
+                self.handlers_map.get(frame.command, self._handle_exception)(frame)
+            )
 
     def eof_received(self) -> None:
         self.connection_lost(Exception("Got EOF from server"))
@@ -572,10 +599,10 @@ class StompProtocol:
             headers = {"id": subscription.id, "destination": subscription.destination}
             self._protocol.send_frame("UNSUBSCRIBE", headers)
 
-    def send(self, headers: Dict[str, Any], body: Union[bytes, str]) -> None:
+    async def send(self, headers: Dict[str, Any], body: Union[bytes, str]) -> None:
         if self._protocol is None:
             raise RuntimeError("Not connected")
-        self._protocol.send_frame("SEND", headers, body)
+        await self._protocol.send_frame("SEND", headers, body)
 
     def ack(self, frame: Frame) -> None:
         if self._protocol:

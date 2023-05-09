@@ -2,11 +2,13 @@ import asyncio
 from typing import Optional
 
 from contextlib import suppress
+from datetime import datetime
 
 
 class StompHeartbeater:
 
     HEART_BEAT = b"\n"
+    MAX_MISS_DELTA = 1_000  # ms
 
     def __init__(
         self,
@@ -19,6 +21,7 @@ class StompHeartbeater:
         self.is_started = False
 
         self.received_heartbeat = None
+        self.last_time_stamp = None
 
     async def start(self) -> None:
         if self.is_started:
@@ -47,3 +50,22 @@ class StompHeartbeater:
 
     async def send(self) -> None:
         self._transport.write(self.HEART_BEAT)
+
+    def beat(self):
+        self.last_time_stamp = datetime.now().timestamp()
+        print(
+            self.last_time_stamp,
+            (datetime.now().timestamp() - self.last_time_stamp),
+            (datetime.now().timestamp() - self.last_time_stamp) <= self.MAX_MISS_DELTA,
+        )
+
+    @property
+    def is_healthy(self):
+        return (
+            self.last_time_stamp
+            and (datetime.now().timestamp() - self.last_time_stamp)
+            <= self.MAX_MISS_DELTA
+        )
+
+    def reset_time_stamp(self):
+        self.last_time_stamp = None
